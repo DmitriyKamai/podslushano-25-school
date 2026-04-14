@@ -30,10 +30,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DB_PATH = _ROOT / "data.sqlite3"
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-ADMIN_USER_ID_RAW = os.environ.get("ADMIN_USER_ID", "").strip()
-TARGET_GROUP_RAW = os.environ.get("TARGET_GROUP_CHAT_ID", "").strip()
-_support = os.environ.get("SUPPORT_USERNAME", "").strip().lstrip("@")
+def _env_strip(key: str) -> str:
+    v = os.environ.get(key, "") or ""
+    return v.strip().strip('"').strip("'").strip()
+
+
+BOT_TOKEN = _env_strip("BOT_TOKEN")
+ADMIN_USER_ID_RAW = _env_strip("ADMIN_USER_ID")
+TARGET_GROUP_RAW = _env_strip("TARGET_GROUP_CHAT_ID")
+_support = _env_strip("SUPPORT_USERNAME").lstrip("@")
 
 MAX_TEXT = 4000
 MAX_CAPTION = 3500
@@ -562,24 +567,23 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         route = lookup_anon_reply_route(chat.id, msg.reply_to_message.message_id)
         if route is not None:
             anon_uid, sub_id = route
-            if msg.text and msg.text.strip().startswith("/"):
-                pass
-            else:
-                await handle_owner_reply_to_sender(update, context, anon_uid, sub_id)
+            await handle_owner_reply_to_sender(update, context, anon_uid, sub_id)
             return
 
     if chat.type != "private" or not user:
         return
 
     admin_id = _admin_user_id()
-    if admin_id is not None and user.id == admin_id:
-        # Сообщения админа в личке без reply на карточку не считаем подачей контента
-        return
-
     target_id = _target_group_chat_id()
     if admin_id is None or target_id is None:
         await msg.reply_text(
-            "Сервис временно недоступен. Попробуйте позже."
+            "Сервис временно недоступен: задайте ADMIN_USER_ID и TARGET_GROUP_CHAT_ID в .env "
+            "рядом с bot.py и перезапустите бота."
+        )
+        logger.warning(
+            "Пропуск приёма: admin_id=%s target_group=%s",
+            admin_id,
+            target_id,
         )
         return
 
@@ -588,31 +592,39 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     text_part = extract_text_content(msg)
     raw_msg = _to_dict(msg)
 
-    row_id = save_submission(
-        user_id=user.id,
-        chat_id=chat.id,
-        message_id=msg.message_id,
-        content_type=ctype,
-        text_content=text_part,
-        identifiers=identifiers,
-        raw_message=raw_msg,
-        recipient_user_id=None,
-        recipient_chat_id=target_id,
-    )
+    try:
+        row_id = save_submission(
+            user_id=user.id,
+            chat_id=chat.id,
+            message_id=msg.message_id,
+            content_type=ctype,
+            text_content=text_part,
+            identifiers=identifiers,
+            raw_message=raw_msg,
+            recipient_user_id=None,
+            recipient_chat_id=target_id,
+        )
 
-    admin_text = build_admin_notification_text(row_id, ctype, identifiers, msg)
-    bot = context.bot
+        admin_text = build_admin_notification_text(row_id, ctype, identifiers, msg)
+        bot = context.bot
 
-    admin_ids = await send_admin_copy_collect_ids(
-        bot, admin_id, chat.id, msg, admin_text
-    )
-    register_anon_reply_routes(admin_id, admin_ids, user.id, row_id)
+        admin_ids = await send_admin_copy_collect_ids(
+            bot, admin_id, chat.id, msg, admin_text
+        )
+        register_anon_reply_routes(admin_id, admin_ids, user.id, row_id)
 
-    group_ids = await publish_to_target_group_collect_ids(bot, target_id, chat.id, msg)
-    if group_ids:
-        register_anon_reply_routes(target_id, group_ids, user.id, row_id)
+        group_ids = await publish_to_target_group_collect_ids(
+            bot, target_id, chat.id, msg
+        )
+        if group_ids:
+            register_anon_reply_routes(target_id, group_ids, user.id, row_id)
 
-    await msg.reply_text("Принято. Спасибо!")
+        await msg.reply_text("Принято. Спасибо!")
+    except Exception:
+        logger.exception("Ошибка при приёме сообщения user_id=%s", user.id)
+        await msg.reply_text(
+            "Не удалось обработать сообщение. Попробуйте ещё раз или другой тип вложения."
+        )
 
 
 def main() -> None:
@@ -624,10 +636,19 @@ def main() -> None:
     if _target_group_chat_id() is None:
         logger.warning("TARGET_GROUP_CHAT_ID не задан")
 
+    aid = _admin_user_id()
+    tid = _target_group_chat_id()
+    logger.info(
+        "Конфиг: ADMIN_USER_ID=%s TARGET_GROUP_CHAT_ID=%s",
+        aid,
+        tid,
+    )
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     private = filters.ChatType.PRIVATE
+    # Текст без команд (в т.ч. одни эмодзи / цифры — не COMMAND)
     app.add_handler(
         MessageHandler(private & filters.TEXT & ~filters.COMMAND, handle_user_message)
     )
@@ -642,8 +663,13 @@ def main() -> None:
     app.add_handler(MessageHandler(private & filters.LOCATION, handle_user_message))
     app.add_handler(MessageHandler(private & filters.CONTACT, handle_user_message))
     app.add_handler(MessageHandler(private & filters.POLL, handle_user_message))
-    # Reply в целевой группе / супергруппе (отдельно от лички, чтобы не дублировать фильтры)
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS, handle_user_message))
+    # Reply в группе и супергруппе (явно оба типа — на разных сборках PTB)
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP,
+            handle_user_message,
+        )
+    )
 
     logger.info("Бот «Подслушано 25 школа» запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
