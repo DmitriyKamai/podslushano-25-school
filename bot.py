@@ -86,15 +86,37 @@ def _max_video_duration_no_size_sec() -> int:
         return 600
 
 
-# Альбом: (user_id, media_group_id) -> (первый message_id, time.monotonic())
-_album_leader: dict[tuple[int, str], tuple[int, float]] = {}
-_ALBUM_LEADER_TTL_SEC = 180.0
+# Один альбом (media_group_id): после успешного кадра до deadline не действует пауза между кадрами
+_album_burst_free_until: dict[tuple[int, str], float] = {}
 
 
-def _private_rate_wait_sec(user_id: int) -> int | None:
-    """None если можно отправить; иначе секунд подождать (округление вверх)."""
-    interval = _rate_limit_private_sec()
+def _album_burst_window_sec() -> float:
+    """Сколько секунд после принятого кадра альбома не требовать паузу для остальных кадров."""
+    try:
+        return max(15.0, float(os.environ.get("ALBUM_BURST_WINDOW_SEC", "120")))
+    except ValueError:
+        return 120.0
+
+
+def _prune_album_burst_deadlines() -> None:
+    if len(_album_burst_free_until) < 400:
+        return
     now = time.monotonic()
+    for k, until in list(_album_burst_free_until.items()):
+        if now >= until:
+            _album_burst_free_until.pop(k, None)
+
+
+def _private_rate_wait_sec(user_id: int, msg) -> int | None:
+    """None если можно отправить; иначе секунд подождать (округление вверх)."""
+    now = time.monotonic()
+    mg = getattr(msg, "media_group_id", None)
+    if mg is not None:
+        _prune_album_burst_deadlines()
+        until = _album_burst_free_until.get((user_id, str(mg)))
+        if until is not None and now < until:
+            return None
+    interval = _rate_limit_private_sec()
     last = _private_submit_last_mono.get(user_id)
     if last is None:
         return None
@@ -173,52 +195,6 @@ def _submission_precheck_msg(msg) -> str | None:
         if msg.sticker.file_size > max_b:
             return "Стикер слишком большой для приёма."
     return None
-
-
-def _prune_album_leaders() -> None:
-    now = time.monotonic()
-    if len(_album_leader) < 300:
-        return
-    for k, (_, t) in list(_album_leader.items()):
-        if now - t > _ALBUM_LEADER_TTL_SEC:
-            _album_leader.pop(k, None)
-
-
-def _album_tail_or_register_leader(user_id: int, msg) -> str | None:
-    """
-    Для media_group: после precheck регистрируем лидера (первый прошедший проверки кадр).
-    Остальные кадры того же альбома отклоняем (один слот приёма / одна публикация).
-    """
-    mg = getattr(msg, "media_group_id", None)
-    if mg is None:
-        return None
-    _prune_album_leaders()
-    key = (user_id, str(mg))
-    now = time.monotonic()
-    prev = _album_leader.get(key)
-    if prev is None:
-        _album_leader[key] = (msg.message_id, now)
-        return None
-    first_mid, t0 = prev
-    if first_mid == msg.message_id:
-        return None
-    if now - t0 > _ALBUM_LEADER_TTL_SEC:
-        _album_leader[key] = (msg.message_id, now)
-        return None
-    return (
-        "Вы отправили альбом из нескольких файлов. Уже принято первое вложение из этого набора. "
-        "Остальное пришлите отдельными сообщениями, если нужно несколько материалов."
-    )
-
-
-def _album_clear_leader_if_leader(user_id: int, msg) -> None:
-    mg = getattr(msg, "media_group_id", None)
-    if mg is None:
-        return
-    key = (user_id, str(mg))
-    prev = _album_leader.get(key)
-    if prev and prev[0] == msg.message_id:
-        _album_leader.pop(key, None)
 
 
 def _admin_user_id() -> int | None:
@@ -765,7 +741,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     async with _submit_lock(user.id):
-        wait = _private_rate_wait_sec(user.id)
+        wait = _private_rate_wait_sec(user.id, msg)
         if wait is not None:
             await msg.reply_text(
                 f"Не чаще одного сообщения в {_rate_limit_private_sec():.0f} сек. "
@@ -774,10 +750,6 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         if err := _submission_precheck_msg(msg):
-            await msg.reply_text(err)
-            return
-
-        if err := _album_tail_or_register_leader(user.id, msg):
             await msg.reply_text(err)
             return
 
@@ -815,8 +787,13 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             await msg.reply_text("Принято. Спасибо!")
             _private_rate_mark(user.id)
+            mg = getattr(msg, "media_group_id", None)
+            if mg is not None:
+                _prune_album_burst_deadlines()
+                _album_burst_free_until[(user.id, str(mg))] = (
+                    time.monotonic() + _album_burst_window_sec()
+                )
         except Exception:
-            _album_clear_leader_if_leader(user.id, msg)
             logger.exception("Ошибка при приёме сообщения user_id=%s", user.id)
             await msg.reply_text(
                 "Не удалось обработать сообщение. Попробуйте ещё раз или другой тип вложения."
@@ -836,10 +813,11 @@ def main() -> None:
     tid = _target_group_chat_id()
     logger.info(
         "Конфиг: ADMIN_USER_ID=%s TARGET_GROUP_CHAT_ID=%s RATE_LIMIT_PRIVATE_SEC=%s "
-        "MAX_VOICE_NOTE_DURATION_SEC=%s MAX_VIDEO_DURATION_NO_SIZE_SEC=%s",
+        "ALBUM_BURST_WINDOW_SEC=%s MAX_VOICE_NOTE_DURATION_SEC=%s MAX_VIDEO_DURATION_NO_SIZE_SEC=%s",
         aid,
         tid,
         _rate_limit_private_sec(),
+        _album_burst_window_sec(),
         _max_voice_note_duration_sec(),
         _max_video_duration_no_size_sec(),
     )
