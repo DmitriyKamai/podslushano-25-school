@@ -73,9 +73,10 @@ def _max_global_submissions_per_window() -> int | None:
     """
     Макс. успешно принятых сообщений за окно GLOBAL_RATE_WINDOW_SEC со всех user_id.
     0 или отрицательное в MAX_GLOBAL_SUBMISSIONS_PER_WINDOW — выключено.
+    По умолчанию без env: 10 приёмов за окно (см. GLOBAL_RATE_WINDOW_SEC).
     """
     try:
-        v = int(os.environ.get("MAX_GLOBAL_SUBMISSIONS_PER_WINDOW", "0"))
+        v = int(os.environ.get("MAX_GLOBAL_SUBMISSIONS_PER_WINDOW", "10"))
     except ValueError:
         return None
     if v <= 0:
