@@ -12,6 +12,7 @@ import os
 import asyncio
 import sqlite3
 import time
+from collections import deque
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,12 +49,92 @@ MAX_CAPTION = 3500
 _private_submit_last_mono: dict[int, float] = {}
 _user_submit_locks: dict[int, asyncio.Lock] = {}
 
+# Глобальный лимит приёмов (все пользователи), скользящее окно + учёт in-flight
+_global_accept_mono: deque[float] = deque()
+_global_accept_inflight = 0
+_global_accept_lock = asyncio.Lock()
+
 
 def _rate_limit_private_sec() -> float:
     try:
         return max(5.0, float(os.environ.get("RATE_LIMIT_PRIVATE_SEC", "60")))
     except ValueError:
         return 60.0
+
+
+def _global_rate_window_sec() -> float:
+    try:
+        return max(10.0, float(os.environ.get("GLOBAL_RATE_WINDOW_SEC", "60")))
+    except ValueError:
+        return 60.0
+
+
+def _max_global_submissions_per_window() -> int | None:
+    """
+    Макс. успешно принятых сообщений за окно GLOBAL_RATE_WINDOW_SEC со всех user_id.
+    0 или отрицательное в MAX_GLOBAL_SUBMISSIONS_PER_WINDOW — выключено.
+    """
+    try:
+        v = int(os.environ.get("MAX_GLOBAL_SUBMISSIONS_PER_WINDOW", "0"))
+    except ValueError:
+        return None
+    if v <= 0:
+        return None
+    return max(5, v)
+
+
+def _global_prune_accepted(window: float) -> None:
+    now = time.monotonic()
+    while _global_accept_mono and now - _global_accept_mono[0] > window:
+        _global_accept_mono.popleft()
+
+
+async def _global_submission_enter() -> str | None:
+    """
+    Зарезервировать слот глобального лимита (учёт in-flight, без гонки).
+    None — можно продолжать; иначе текст отказа пользователю.
+    """
+    global _global_accept_inflight
+    cap = _max_global_submissions_per_window()
+    if cap is None:
+        return None
+    window = _global_rate_window_sec()
+    now = time.monotonic()
+    async with _global_accept_lock:
+        _global_prune_accepted(window)
+        if len(_global_accept_mono) + _global_accept_inflight >= cap:
+            logger.warning(
+                "Глобальный лимит приёма: принято+в обработке %s/%s за %.0f с",
+                len(_global_accept_mono) + _global_accept_inflight,
+                cap,
+                window,
+            )
+            return (
+                "Сейчас очень много обращений к боту. Попробуйте отправить сообщение "
+                "через несколько минут."
+            )
+        _global_accept_inflight += 1
+    return None
+
+
+async def _global_submission_leave_success() -> None:
+    global _global_accept_inflight
+    cap = _max_global_submissions_per_window()
+    if cap is None:
+        return
+    window = _global_rate_window_sec()
+    async with _global_accept_lock:
+        _global_accept_inflight = max(0, _global_accept_inflight - 1)
+        _global_accept_mono.append(time.monotonic())
+        _global_prune_accepted(window)
+
+
+async def _global_submission_leave_failure() -> None:
+    global _global_accept_inflight
+    if _max_global_submissions_per_window() is None:
+        return
+    async with _global_accept_lock:
+        _global_accept_inflight = max(0, _global_accept_inflight - 1)
 
 
 def _max_document_bytes() -> int:
@@ -756,6 +837,10 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await msg.reply_text(err)
             return
 
+        if err := await _global_submission_enter():
+            await msg.reply_text(err)
+            return
+
         identifiers = collect_identifiers(update)
         ctype = message_content_type(msg)
         text_part = extract_text_content(msg)
@@ -786,6 +871,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             await msg.reply_text("Принято. Спасибо!")
             _private_rate_mark(user.id)
+            await _global_submission_leave_success()
             mg = getattr(msg, "media_group_id", None)
             if mg is not None:
                 _prune_album_burst_deadlines()
@@ -793,6 +879,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     time.monotonic() + _album_burst_window_sec()
                 )
         except Exception:
+            await _global_submission_leave_failure()
             logger.exception("Ошибка при приёме сообщения user_id=%s", user.id)
             await msg.reply_text(
                 "Не удалось обработать сообщение. Попробуйте ещё раз или другой тип вложения."
@@ -810,13 +897,17 @@ def main() -> None:
 
     aid = _admin_user_id()
     tid = _target_group_chat_id()
+    gcap = _max_global_submissions_per_window()
     logger.info(
         "Конфиг: ADMIN_USER_ID=%s TARGET_GROUP_CHAT_ID=%s RATE_LIMIT_PRIVATE_SEC=%s "
-        "ALBUM_BURST_WINDOW_SEC=%s MAX_VOICE_NOTE_DURATION_SEC=%s MAX_VIDEO_DURATION_NO_SIZE_SEC=%s",
+        "ALBUM_BURST_WINDOW_SEC=%s MAX_GLOBAL_SUBMISSIONS_PER_WINDOW=%s GLOBAL_RATE_WINDOW_SEC=%s "
+        "MAX_VOICE_NOTE_DURATION_SEC=%s MAX_VIDEO_DURATION_NO_SIZE_SEC=%s",
         aid,
         tid,
         _rate_limit_private_sec(),
         _album_burst_window_sec(),
+        gcap if gcap is not None else "off",
+        _global_rate_window_sec(),
         _max_voice_note_duration_sec(),
         _max_video_duration_no_size_sec(),
     )
