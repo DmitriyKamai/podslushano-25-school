@@ -1,6 +1,6 @@
 """
 Бот «Подслушано 25 школа»: личка → полная копия админу + публикация в целевой чат;
-ответы по reply на сообщения бота (в личке админа или в целевом чате).
+ответы по reply на сообщения бота только в личке админа (в целевой группе ответы не маршрутизируются).
 """
 
 from __future__ import annotations
@@ -553,7 +553,7 @@ async def publish_to_target_group_collect_ids(
     source_chat_id: int,
     msg,
 ) -> list[int]:
-    """Публикация в целевой чат без ID отправителя в тексте; message_id для reply-маршрутов."""
+    """Публикация в целевой чат без ID отправителя в тексте; message_id — для логов/расширений."""
     ids: list[int] = []
     try:
         if msg.text and not msg.photo:
@@ -717,6 +717,9 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
 
     if msg.reply_to_message:
+        tid = _target_group_chat_id()
+        if tid is not None and chat.id == tid:
+            return
         route = lookup_anon_reply_route(chat.id, msg.reply_to_message.message_id)
         if route is not None:
             anon_uid, sub_id = route
@@ -779,11 +782,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             register_anon_reply_routes(admin_id, admin_ids, user.id, row_id)
 
-            group_ids = await publish_to_target_group_collect_ids(
-                bot, target_id, chat.id, msg
-            )
-            if group_ids:
-                register_anon_reply_routes(target_id, group_ids, user.id, row_id)
+            await publish_to_target_group_collect_ids(bot, target_id, chat.id, msg)
 
             await msg.reply_text("Принято. Спасибо!")
             _private_rate_mark(user.id)
