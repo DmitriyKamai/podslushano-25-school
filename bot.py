@@ -70,6 +70,27 @@ def _max_user_text_chars() -> int:
         return 12000
 
 
+def _max_voice_note_duration_sec() -> int:
+    """Если у голоса/кружка нет file_size в API — ограничение по длительности (сек)."""
+    try:
+        return max(5, int(os.environ.get("MAX_VOICE_NOTE_DURATION_SEC", "600")))
+    except ValueError:
+        return 600
+
+
+def _max_video_duration_no_size_sec() -> int:
+    """Видео без file_size в ответе API — лимит по duration (сек)."""
+    try:
+        return max(10, int(os.environ.get("MAX_VIDEO_DURATION_NO_SIZE_SEC", "600")))
+    except ValueError:
+        return 600
+
+
+# Альбом: (user_id, media_group_id) -> (первый message_id, time.monotonic())
+_album_leader: dict[tuple[int, str], tuple[int, float]] = {}
+_ALBUM_LEADER_TTL_SEC = 180.0
+
+
 def _private_rate_wait_sec(user_id: int) -> int | None:
     """None если можно отправить; иначе секунд подождать (округление вверх)."""
     interval = _rate_limit_private_sec()
@@ -100,23 +121,104 @@ def _submit_lock(user_id: int) -> asyncio.Lock:
 
 def _submission_precheck_msg(msg) -> str | None:
     """Текст ошибки для пользователя или None."""
+    max_b = _max_document_bytes()
     if msg.text and len(msg.text) > _max_user_text_chars():
         return "Слишком длинный текст. Сократите сообщение."
     if msg.caption and len(msg.caption) > _max_user_text_chars():
         return "Слишком длинная подпись."
+    if msg.photo:
+        largest = msg.photo[-1]
+        if largest.file_size is not None and largest.file_size > max_b:
+            return "Фото слишком большое по размеру. Сожмите или отправьте меньшим файлом."
     if msg.document and msg.document.file_size is not None:
-        if msg.document.file_size > _max_document_bytes():
+        if msg.document.file_size > max_b:
             return "Файл слишком большой."
-    if msg.video and msg.video.file_size is not None:
-        if msg.video.file_size > _max_document_bytes():
-            return "Видео слишком большое."
+    if msg.video:
+        if msg.video.file_size is not None:
+            if msg.video.file_size > max_b:
+                return "Видео слишком большое."
+        elif msg.video.duration is not None:
+            if msg.video.duration > _max_video_duration_no_size_sec():
+                return "Видео слишком длинное. Сократите длительность или отправьте файлом."
     if msg.animation and msg.animation.file_size is not None:
-        if msg.animation.file_size > _max_document_bytes():
+        if msg.animation.file_size > max_b:
             return "Анимация слишком большая."
     if msg.audio and msg.audio.file_size is not None:
-        if msg.audio.file_size > _max_document_bytes():
+        if msg.audio.file_size > max_b:
             return "Аудио слишком большое."
+    if msg.voice:
+        if msg.voice.file_size is not None:
+            if msg.voice.file_size > max_b:
+                return "Голосовое слишком большое."
+        elif msg.voice.duration is not None:
+            if msg.voice.duration > _max_voice_note_duration_sec():
+                return "Голосовое слишком длинное. Запишите короче или отправьте как файл."
+        else:
+            return (
+                "Не удалось оценить размер голосового. Отправьте как документ (файлом) "
+                "или короткое сообщение."
+            )
+    if msg.video_note:
+        if msg.video_note.file_size is not None:
+            if msg.video_note.file_size > max_b:
+                return "Видеокружок слишком большой."
+        elif msg.video_note.duration is not None:
+            if msg.video_note.duration > _max_voice_note_duration_sec():
+                return "Видеокружок слишком длинный."
+        else:
+            return (
+                "Не удалось оценить размер видеокружка. Отправьте как видеофайл или короче."
+            )
+    if msg.sticker and msg.sticker.file_size is not None:
+        if msg.sticker.file_size > max_b:
+            return "Стикер слишком большой для приёма."
     return None
+
+
+def _prune_album_leaders() -> None:
+    now = time.monotonic()
+    if len(_album_leader) < 300:
+        return
+    for k, (_, t) in list(_album_leader.items()):
+        if now - t > _ALBUM_LEADER_TTL_SEC:
+            _album_leader.pop(k, None)
+
+
+def _album_tail_or_register_leader(user_id: int, msg) -> str | None:
+    """
+    Для media_group: после precheck регистрируем лидера (первый прошедший проверки кадр).
+    Остальные кадры того же альбома отклоняем (один слот приёма / одна публикация).
+    """
+    mg = getattr(msg, "media_group_id", None)
+    if mg is None:
+        return None
+    _prune_album_leaders()
+    key = (user_id, str(mg))
+    now = time.monotonic()
+    prev = _album_leader.get(key)
+    if prev is None:
+        _album_leader[key] = (msg.message_id, now)
+        return None
+    first_mid, t0 = prev
+    if first_mid == msg.message_id:
+        return None
+    if now - t0 > _ALBUM_LEADER_TTL_SEC:
+        _album_leader[key] = (msg.message_id, now)
+        return None
+    return (
+        "Вы отправили альбом из нескольких файлов. Уже принято первое вложение из этого набора. "
+        "Остальное пришлите отдельными сообщениями, если нужно несколько материалов."
+    )
+
+
+def _album_clear_leader_if_leader(user_id: int, msg) -> None:
+    mg = getattr(msg, "media_group_id", None)
+    if mg is None:
+        return
+    key = (user_id, str(mg))
+    prev = _album_leader.get(key)
+    if prev and prev[0] == msg.message_id:
+        _album_leader.pop(key, None)
 
 
 def _admin_user_id() -> int | None:
@@ -662,10 +764,6 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    if err := _submission_precheck_msg(msg):
-        await msg.reply_text(err)
-        return
-
     async with _submit_lock(user.id):
         wait = _private_rate_wait_sec(user.id)
         if wait is not None:
@@ -673,6 +771,14 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"Не чаще одного сообщения в {_rate_limit_private_sec():.0f} сек. "
                 f"Подождите ещё ~{wait} с."
             )
+            return
+
+        if err := _submission_precheck_msg(msg):
+            await msg.reply_text(err)
+            return
+
+        if err := _album_tail_or_register_leader(user.id, msg):
+            await msg.reply_text(err)
             return
 
         identifiers = collect_identifiers(update)
@@ -710,6 +816,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await msg.reply_text("Принято. Спасибо!")
             _private_rate_mark(user.id)
         except Exception:
+            _album_clear_leader_if_leader(user.id, msg)
             logger.exception("Ошибка при приёме сообщения user_id=%s", user.id)
             await msg.reply_text(
                 "Не удалось обработать сообщение. Попробуйте ещё раз или другой тип вложения."
@@ -728,10 +835,13 @@ def main() -> None:
     aid = _admin_user_id()
     tid = _target_group_chat_id()
     logger.info(
-        "Конфиг: ADMIN_USER_ID=%s TARGET_GROUP_CHAT_ID=%s RATE_LIMIT_PRIVATE_SEC=%s",
+        "Конфиг: ADMIN_USER_ID=%s TARGET_GROUP_CHAT_ID=%s RATE_LIMIT_PRIVATE_SEC=%s "
+        "MAX_VOICE_NOTE_DURATION_SEC=%s MAX_VIDEO_DURATION_NO_SIZE_SEC=%s",
         aid,
         tid,
         _rate_limit_private_sec(),
+        _max_voice_note_duration_sec(),
+        _max_video_duration_no_size_sec(),
     )
 
     app = Application.builder().token(BOT_TOKEN).build()
