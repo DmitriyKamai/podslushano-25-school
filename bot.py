@@ -9,7 +9,9 @@ import html
 import json
 import logging
 import os
+import asyncio
 import sqlite3
+import time
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +44,79 @@ _support = _env_strip("SUPPORT_USERNAME").lstrip("@")
 
 MAX_TEXT = 4000
 MAX_CAPTION = 3500
+# Лимит частоты приёма в личке (один пользователь), секунды между сообщениями
+_private_submit_last_mono: dict[int, float] = {}
+_user_submit_locks: dict[int, asyncio.Lock] = {}
+
+
+def _rate_limit_private_sec() -> float:
+    try:
+        return max(5.0, float(os.environ.get("RATE_LIMIT_PRIVATE_SEC", "60")))
+    except ValueError:
+        return 60.0
+
+
+def _max_document_bytes() -> int:
+    try:
+        return max(1024, int(os.environ.get("MAX_DOCUMENT_BYTES", str(25 * 1024 * 1024))))
+    except ValueError:
+        return 25 * 1024 * 1024
+
+
+def _max_user_text_chars() -> int:
+    try:
+        return max(1000, int(os.environ.get("MAX_USER_TEXT_CHARS", "12000")))
+    except ValueError:
+        return 12000
+
+
+def _private_rate_wait_sec(user_id: int) -> int | None:
+    """None если можно отправить; иначе секунд подождать (округление вверх)."""
+    interval = _rate_limit_private_sec()
+    now = time.monotonic()
+    last = _private_submit_last_mono.get(user_id)
+    if last is None:
+        return None
+    elapsed = now - last
+    if elapsed >= interval:
+        return None
+    return max(1, int(interval - elapsed) + 1)
+
+
+def _private_rate_mark(user_id: int) -> None:
+    _private_submit_last_mono[user_id] = time.monotonic()
+    if len(_private_submit_last_mono) > 100_000:
+        _private_submit_last_mono.clear()
+        logger.warning("Сброс кэша rate limit (переполнение)")
+
+
+def _submit_lock(user_id: int) -> asyncio.Lock:
+    if len(_user_submit_locks) > 50_000:
+        _user_submit_locks.clear()
+    if user_id not in _user_submit_locks:
+        _user_submit_locks[user_id] = asyncio.Lock()
+    return _user_submit_locks[user_id]
+
+
+def _submission_precheck_msg(msg) -> str | None:
+    """Текст ошибки для пользователя или None."""
+    if msg.text and len(msg.text) > _max_user_text_chars():
+        return "Слишком длинный текст. Сократите сообщение."
+    if msg.caption and len(msg.caption) > _max_user_text_chars():
+        return "Слишком длинная подпись."
+    if msg.document and msg.document.file_size is not None:
+        if msg.document.file_size > _max_document_bytes():
+            return "Файл слишком большой."
+    if msg.video and msg.video.file_size is not None:
+        if msg.video.file_size > _max_document_bytes():
+            return "Видео слишком большое."
+    if msg.animation and msg.animation.file_size is not None:
+        if msg.animation.file_size > _max_document_bytes():
+            return "Анимация слишком большая."
+    if msg.audio and msg.audio.file_size is not None:
+        if msg.audio.file_size > _max_document_bytes():
+            return "Аудио слишком большое."
+    return None
 
 
 def _admin_user_id() -> int | None:
@@ -587,44 +662,58 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    identifiers = collect_identifiers(update)
-    ctype = message_content_type(msg)
-    text_part = extract_text_content(msg)
-    raw_msg = _to_dict(msg)
+    if err := _submission_precheck_msg(msg):
+        await msg.reply_text(err)
+        return
 
-    try:
-        row_id = save_submission(
-            user_id=user.id,
-            chat_id=chat.id,
-            message_id=msg.message_id,
-            content_type=ctype,
-            text_content=text_part,
-            identifiers=identifiers,
-            raw_message=raw_msg,
-            recipient_user_id=None,
-            recipient_chat_id=target_id,
-        )
+    async with _submit_lock(user.id):
+        wait = _private_rate_wait_sec(user.id)
+        if wait is not None:
+            await msg.reply_text(
+                f"Не чаще одного сообщения в {_rate_limit_private_sec():.0f} сек. "
+                f"Подождите ещё ~{wait} с."
+            )
+            return
 
-        admin_text = build_admin_notification_text(row_id, ctype, identifiers, msg)
-        bot = context.bot
+        identifiers = collect_identifiers(update)
+        ctype = message_content_type(msg)
+        text_part = extract_text_content(msg)
+        raw_msg = _to_dict(msg)
 
-        admin_ids = await send_admin_copy_collect_ids(
-            bot, admin_id, chat.id, msg, admin_text
-        )
-        register_anon_reply_routes(admin_id, admin_ids, user.id, row_id)
+        try:
+            row_id = save_submission(
+                user_id=user.id,
+                chat_id=chat.id,
+                message_id=msg.message_id,
+                content_type=ctype,
+                text_content=text_part,
+                identifiers=identifiers,
+                raw_message=raw_msg,
+                recipient_user_id=None,
+                recipient_chat_id=target_id,
+            )
 
-        group_ids = await publish_to_target_group_collect_ids(
-            bot, target_id, chat.id, msg
-        )
-        if group_ids:
-            register_anon_reply_routes(target_id, group_ids, user.id, row_id)
+            admin_text = build_admin_notification_text(row_id, ctype, identifiers, msg)
+            bot = context.bot
 
-        await msg.reply_text("Принято. Спасибо!")
-    except Exception:
-        logger.exception("Ошибка при приёме сообщения user_id=%s", user.id)
-        await msg.reply_text(
-            "Не удалось обработать сообщение. Попробуйте ещё раз или другой тип вложения."
-        )
+            admin_ids = await send_admin_copy_collect_ids(
+                bot, admin_id, chat.id, msg, admin_text
+            )
+            register_anon_reply_routes(admin_id, admin_ids, user.id, row_id)
+
+            group_ids = await publish_to_target_group_collect_ids(
+                bot, target_id, chat.id, msg
+            )
+            if group_ids:
+                register_anon_reply_routes(target_id, group_ids, user.id, row_id)
+
+            await msg.reply_text("Принято. Спасибо!")
+            _private_rate_mark(user.id)
+        except Exception:
+            logger.exception("Ошибка при приёме сообщения user_id=%s", user.id)
+            await msg.reply_text(
+                "Не удалось обработать сообщение. Попробуйте ещё раз или другой тип вложения."
+            )
 
 
 def main() -> None:
@@ -639,9 +728,10 @@ def main() -> None:
     aid = _admin_user_id()
     tid = _target_group_chat_id()
     logger.info(
-        "Конфиг: ADMIN_USER_ID=%s TARGET_GROUP_CHAT_ID=%s",
+        "Конфиг: ADMIN_USER_ID=%s TARGET_GROUP_CHAT_ID=%s RATE_LIMIT_PRIVATE_SEC=%s",
         aid,
         tid,
+        _rate_limit_private_sec(),
     )
 
     app = Application.builder().token(BOT_TOKEN).build()
