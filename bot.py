@@ -279,6 +279,16 @@ def _submission_precheck_msg(msg) -> str | None:
     return None
 
 
+def _is_start_command_text(text: str | None) -> bool:
+    if not text:
+        return False
+    raw = text.strip()
+    if not raw.startswith("/"):
+        return False
+    cmd = raw.split(maxsplit=1)[0].lower()
+    return cmd == "/start" or cmd.startswith("/start@")
+
+
 def _admin_user_id() -> int | None:
     if not ADMIN_USER_ID_RAW:
         return None
@@ -309,6 +319,7 @@ def init_db() -> None:
                 message_id INTEGER,
                 content_type TEXT,
                 text_content TEXT,
+                content_fingerprint TEXT,
                 identifiers_json TEXT NOT NULL,
                 raw_message_json TEXT,
                 recipient_user_id INTEGER,
@@ -321,6 +332,16 @@ def init_db() -> None:
             conn.execute("ALTER TABLE submissions ADD COLUMN recipient_user_id INTEGER")
         if "recipient_chat_id" not in cols:
             conn.execute("ALTER TABLE submissions ADD COLUMN recipient_chat_id INTEGER")
+        if "content_fingerprint" not in cols:
+            conn.execute("ALTER TABLE submissions ADD COLUMN content_fingerprint TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_submissions_fp_time "
+            "ON submissions(content_fingerprint, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_submissions_uid_fp_time "
+            "ON submissions(user_id, content_fingerprint, created_at)"
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS anon_reply_routes (
@@ -335,6 +356,15 @@ def init_db() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_anon_route_dest ON anon_reply_routes(dest_chat_id)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS blacklist (
+                user_id INTEGER PRIMARY KEY,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
         )
         conn.commit()
 
@@ -431,6 +461,114 @@ def extract_text_content(msg) -> str | None:
     return None
 
 
+def _message_identity_piece(msg, ctype: str) -> str:
+    if msg.text:
+        return msg.text.strip()
+    if msg.caption:
+        return msg.caption.strip()
+    if msg.photo:
+        return msg.photo[-1].file_unique_id
+    if msg.video:
+        return msg.video.file_unique_id
+    if msg.document:
+        return msg.document.file_unique_id
+    if msg.voice:
+        return msg.voice.file_unique_id
+    if msg.video_note:
+        return msg.video_note.file_unique_id
+    if msg.audio:
+        return msg.audio.file_unique_id
+    if msg.sticker:
+        return msg.sticker.file_unique_id
+    if msg.animation:
+        return msg.animation.file_unique_id
+    if msg.location:
+        return f"{msg.location.latitude:.6f},{msg.location.longitude:.6f}"
+    if msg.contact:
+        return f"{msg.contact.phone_number}:{msg.contact.user_id}"
+    if msg.poll:
+        return (msg.poll.question or "").strip()
+    return ctype
+
+
+def build_message_fingerprint(msg, ctype: str) -> str:
+    piece = _message_identity_piece(msg, ctype)
+    return f"{ctype}|{piece}"
+
+
+def is_blacklisted(user_id: int) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM blacklist WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return row is not None
+
+
+def blacklist_users(user_ids: set[int], reason: str) -> None:
+    if not user_ids:
+        return
+    created = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        for uid in user_ids:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO blacklist(user_id, reason, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (uid, reason, created),
+            )
+        conn.commit()
+
+
+def detect_and_apply_blacklist_for_duplicate(
+    user_id: int,
+    fingerprint: str,
+) -> tuple[bool, set[int]]:
+    now = datetime.now(timezone.utc)
+    minute_start = now.replace(second=0, microsecond=0).isoformat()
+    minute_end = now.replace(second=59, microsecond=999999).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        same_user_row = conn.execute(
+            """
+            SELECT COUNT(*) FROM submissions
+            WHERE user_id = ?
+              AND content_fingerprint = ?
+              AND created_at >= ? AND created_at <= ?
+            """,
+            (user_id, fingerprint, minute_start, minute_end),
+        ).fetchone()
+        matched_rows = conn.execute(
+            """
+            SELECT DISTINCT user_id FROM submissions
+            WHERE content_fingerprint = ?
+              AND created_at >= ? AND created_at <= ?
+              AND user_id IS NOT NULL
+            """,
+            (fingerprint, minute_start, minute_end),
+        ).fetchall()
+    same_user_count = int(same_user_row[0]) if same_user_row else 0
+    matched_users = {int(r[0]) for r in matched_rows if r[0] is not None}
+    other_users = {uid for uid in matched_users if uid != user_id}
+    should_block = same_user_count >= 1 or bool(other_users)
+    if not should_block:
+        return False, set()
+    to_block = {user_id}
+    if other_users:
+        to_block.update(other_users)
+        reason = (
+            "Дубликат сообщения за минуту между разными пользователями "
+            f"(fingerprint={fingerprint})"
+        )
+    else:
+        reason = (
+            "Повторная отправка одинакового сообщения одним пользователем "
+            f"в течение минуты (fingerprint={fingerprint})"
+        )
+    blacklist_users(to_block, reason)
+    return True, to_block
+
+
 def format_message_body_for_admin(msg, ctype: str) -> str:
     if msg.text and not msg.photo:
         return msg.text or ""
@@ -493,6 +631,7 @@ def save_submission(
     message_id: int | None,
     content_type: str,
     text_content: str | None,
+    content_fingerprint: str | None,
     identifiers: dict[str, Any],
     raw_message: dict[str, Any] | None,
     recipient_user_id: int | None = None,
@@ -505,9 +644,9 @@ def save_submission(
         cur = conn.execute(
             """
             INSERT INTO submissions
-            (created_at, user_id, chat_id, message_id, content_type, text_content,
+            (created_at, user_id, chat_id, message_id, content_type, text_content, content_fingerprint,
              identifiers_json, raw_message_json, recipient_user_id, recipient_chat_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 created,
@@ -516,6 +655,7 @@ def save_submission(
                 message_id,
                 content_type,
                 text_content,
+                content_fingerprint,
                 identifiers_json,
                 raw_json,
                 recipient_user_id,
@@ -811,6 +951,10 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if chat.type != "private" or not user:
         return
 
+    if is_blacklisted(user.id):
+        await msg.reply_text("Вы добавлены в блек-лист за дублирование сообщений.")
+        return
+
     admin_id = _admin_user_id()
     target_id = _target_group_chat_id()
     if admin_id is None or target_id is None:
@@ -838,14 +982,30 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await msg.reply_text(err)
             return
 
-        if err := await _global_submission_enter():
-            await msg.reply_text(err)
-            return
-
         identifiers = collect_identifiers(update)
         ctype = message_content_type(msg)
         text_part = extract_text_content(msg)
+        fingerprint = build_message_fingerprint(msg, ctype)
         raw_msg = _to_dict(msg)
+
+        if not _is_start_command_text(msg.text):
+            blocked, blocked_users = detect_and_apply_blacklist_for_duplicate(
+                user.id, fingerprint
+            )
+            if blocked:
+                logger.warning(
+                    "Пользователи добавлены в blacklist за дубли: %s",
+                    sorted(blocked_users),
+                )
+                await msg.reply_text(
+                    "Сообщение отклонено: обнаружен дубликат в ту же минуту. "
+                    "Вы добавлены в блек-лист."
+                )
+                return
+
+        if err := await _global_submission_enter():
+            await msg.reply_text(err)
+            return
 
         try:
             row_id = save_submission(
@@ -854,6 +1014,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 message_id=msg.message_id,
                 content_type=ctype,
                 text_content=text_part,
+                content_fingerprint=fingerprint,
                 identifiers=identifiers,
                 raw_message=raw_msg,
                 recipient_user_id=None,
